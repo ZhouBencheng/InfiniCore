@@ -22,6 +22,7 @@
 #include "infiniop/ops/equal.h"
 #include "infiniop/ops/flash_attention.h"
 #include "infiniop/ops/fmod.h"
+#include "infiniop/ops/fused_ffn.h"
 #include "infiniop/ops/gelu.h"
 #include "infiniop/ops/gemm.h"
 #include "infiniop/ops/hardswish.h"

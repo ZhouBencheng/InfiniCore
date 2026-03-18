@@ -91,6 +91,7 @@ std::string Test::toString() const {
 }
 
 Test::~Test() {
+    (void)_rtol; (void)_atol; // suppress unused warning
     delete _attributes;
 }
 

@@ -76,6 +76,7 @@ public:
         size_t warm_ups, size_t iterations)
         = 0;
     virtual std::string toString() const = 0;
+    virtual ~Test() = default;
 };
 
 } // namespace infiniop_test::base

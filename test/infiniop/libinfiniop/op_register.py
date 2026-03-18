@@ -1622,3 +1622,44 @@ def silu_and_mul(lib):
     lib.infiniopDestroySiluAndMulDescriptor.argtypes = [
         infiniopOperatorDescriptor_t,
     ]
+
+
+@OpRegister.operator
+def fused_ffn(lib):
+    lib.infiniopCreateFusedFFNDescriptor.restype = c_int32
+    lib.infiniopCreateFusedFFNDescriptor.argtypes = [
+        infiniopHandle_t,
+        POINTER(infiniopOperatorDescriptor_t),
+        infiniopTensorDescriptor_t,  # out_desc
+        infiniopTensorDescriptor_t,  # in_desc
+        infiniopTensorDescriptor_t,  # residual_desc
+        infiniopTensorDescriptor_t,  # norm_weight_desc
+        infiniopTensorDescriptor_t,  # gate_up_weight_desc
+        infiniopTensorDescriptor_t,  # down_weight_desc
+        c_float,  # epsilon
+    ]
+
+    lib.infiniopGetFusedFFNWorkspaceSize.restype = c_int32
+    lib.infiniopGetFusedFFNWorkspaceSize.argtypes = [
+        infiniopOperatorDescriptor_t,
+        POINTER(c_size_t),
+    ]
+
+    lib.infiniopFusedFFN.restype = c_int32
+    lib.infiniopFusedFFN.argtypes = [
+        infiniopOperatorDescriptor_t,
+        c_void_p,  # workspace
+        c_size_t,  # workspace_size
+        c_void_p,  # out
+        c_void_p,  # in
+        c_void_p,  # residual
+        c_void_p,  # norm_weight
+        c_void_p,  # gate_up_weight
+        c_void_p,  # down_weight
+        c_void_p,  # stream
+    ]
+
+    lib.infiniopDestroyFusedFFNDescriptor.restype = c_int32
+    lib.infiniopDestroyFusedFFNDescriptor.argtypes = [
+        infiniopOperatorDescriptor_t,
+    ]
