@@ -8,8 +8,61 @@
 #include "infiniop/ops/gemm.h"
 #include "infiniop/ops/rearrange.h"
 
+#ifdef ENABLE_ILUVATAR_API
+#include "iluvatar/attention_iluvatar.cuh"
+#endif
+
 #include <cmath>
+#include <cstdlib>
 #include <cstdint>
+
+namespace {
+#ifdef ENABLE_ILUVATAR_API
+constexpr size_t kIluvatarFusedMaxHeadDim = 128;
+constexpr size_t kIluvatarFusedMaxTotalSeqLen = 8;
+
+bool iluvatar_fused_attention_disabled() {
+    const char *value = std::getenv("INFINIOP_DISABLE_ILUVATAR_FUSED_ATTENTION");
+    if (!value) {
+        return false;
+    }
+    return value[0] == '1' || value[0] == 'y' || value[0] == 'Y' || value[0] == 't' || value[0] == 'T';
+}
+
+bool can_use_iluvatar_fused_attention(infiniopHandle_t handle,
+                                      infiniopTensorDescriptor_t out_desc,
+                                      infiniopTensorDescriptor_t q_desc,
+                                      infiniopTensorDescriptor_t k_desc,
+                                      infiniopTensorDescriptor_t v_desc,
+                                      infiniopTensorDescriptor_t k_cache_desc,
+                                      infiniopTensorDescriptor_t v_cache_desc,
+                                      size_t pos) {
+    if (handle->device != INFINI_DEVICE_ILUVATAR) {
+        return false;
+    }
+    if (iluvatar_fused_attention_disabled()) {
+        return false;
+    }
+    if (!out_desc->isContiguous() || !q_desc->isContiguous() || !k_desc->isContiguous() || !v_desc->isContiguous()
+        || !k_cache_desc->isContiguous() || !v_cache_desc->isContiguous()) {
+        return false;
+    }
+    if (q_desc->dtype() != k_desc->dtype() || q_desc->dtype() != v_desc->dtype() || q_desc->dtype() != out_desc->dtype()
+        || q_desc->dtype() != k_cache_desc->dtype() || q_desc->dtype() != v_cache_desc->dtype()) {
+        return false;
+    }
+    if (q_desc->dtype() != INFINI_DTYPE_F16) {
+        return false;
+    }
+    if (q_desc->shape()[0] != k_desc->shape()[0]) {
+        return false;
+    }
+    size_t head_dim = q_desc->shape()[2];
+    size_t total_seq_len = q_desc->shape()[1] + pos;
+    return head_dim > 0 && head_dim <= kIluvatarFusedMaxHeadDim && total_seq_len <= kIluvatarFusedMaxTotalSeqLen;
+}
+#endif
+} // namespace
 
 struct InfiniopAttentionDescriptor {
     InfiniopDescriptor _super;
@@ -29,6 +82,15 @@ struct InfiniopAttentionDescriptor {
     size_t k_cache_offset;
     size_t v_cache_offset;
     float qk_alpha;
+    bool use_iluvatar_fused;
+    infiniDtype_t dtype;
+    size_t n_q_head;
+    size_t n_kv_head;
+    size_t seq_len;
+    size_t head_dim;
+    size_t total_seq_len;
+    size_t cache_len;
+    size_t pos;
 };
 
 __INFINI_C __export infiniStatus_t infiniopCreateAttentionDescriptor(infiniopHandle_t handle,
@@ -55,11 +117,14 @@ __INFINI_C __export infiniStatus_t infiniopCreateAttentionDescriptor(infiniopHan
     size_t n_q_head = q_desc->shape()[0];
     size_t seq_len = q_desc->shape()[1];
     size_t head_dim = q_desc->shape()[2];
-    size_t hidden_size = n_q_head * head_dim;
     size_t n_kv_head = k_desc->shape()[0];
     size_t total_seq_len = seq_len + pos;
-    size_t n_group = n_q_head / n_kv_head;
     size_t alignment = 256;
+
+    if (n_q_head == 0 || n_kv_head == 0 || n_q_head % n_kv_head != 0) {
+        return INFINI_STATUS_BAD_PARAM;
+    }
+    size_t n_group = n_q_head / n_kv_head;
 
     if (out_desc->shape()[0] != seq_len || out_desc->shape()[1] != n_q_head || out_desc->shape()[2] != head_dim) {
         return INFINI_STATUS_BAD_PARAM;
@@ -85,6 +150,60 @@ __INFINI_C __export infiniStatus_t infiniopCreateAttentionDescriptor(infiniopHan
         return INFINI_STATUS_BAD_PARAM;
     }
 
+#ifdef ENABLE_ILUVATAR_API
+    if (can_use_iluvatar_fused_attention(handle, out_desc, q_desc, k_desc, v_desc, k_cache_desc, v_cache_desc, pos)) {
+        infiniopTensorDescriptor_t dst_k_desc_fast;
+        CHECK_STATUS(infiniopCreateTensorDescriptor(&dst_k_desc_fast, 3, k_desc->shape().data(), k_cache_desc->strides().data(), k_cache_desc->dtype()));
+        infiniopRearrangeDescriptor_t rearrange_desc_k_fast;
+        CHECK_STATUS(infiniopCreateRearrangeDescriptor(handle, &rearrange_desc_k_fast, dst_k_desc_fast, k_desc));
+
+        infiniopTensorDescriptor_t dst_v_desc_fast;
+        CHECK_STATUS(infiniopCreateTensorDescriptor(&dst_v_desc_fast, 3, v_desc->shape().data(), v_cache_desc->strides().data(), v_cache_desc->dtype()));
+        infiniopRearrangeDescriptor_t rearrange_desc_v_fast;
+        CHECK_STATUS(infiniopCreateRearrangeDescriptor(handle, &rearrange_desc_v_fast, dst_v_desc_fast, v_desc));
+
+        size_t k_cache_offset_fast = 0;
+        if (pos > 0) {
+            k_cache_offset_fast = pos * k_cache_desc->getByteStrides()[1];
+        }
+
+        size_t v_cache_offset_fast = 0;
+        if (pos > 0) {
+            v_cache_offset_fast = pos * v_cache_desc->getByteStrides()[1];
+        }
+
+        *(InfiniopAttentionDescriptor **)desc_ptr = new InfiniopAttentionDescriptor{
+            {handle->device, handle->device_id},
+            rearrange_desc_k_fast,
+            rearrange_desc_v_fast,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            k_cache_offset_fast,
+            v_cache_offset_fast,
+            1.f / std::sqrt(float(head_dim)),
+            true,
+            q_desc->dtype(),
+            n_q_head,
+            n_kv_head,
+            seq_len,
+            head_dim,
+            total_seq_len,
+            k_cache_desc->shape()[1],
+            pos,
+        };
+        return INFINI_STATUS_SUCCESS;
+    }
+#endif
+
     // Rearrange k into k_cache
     infiniopTensorDescriptor_t dst_k_desc;
     CHECK_STATUS(infiniopCreateTensorDescriptor(&dst_k_desc, 3, k_desc->shape().data(), k_cache_desc->strides().data(), k_cache_desc->dtype()));
@@ -99,12 +218,11 @@ __INFINI_C __export infiniStatus_t infiniopCreateAttentionDescriptor(infiniopHan
 
     infiniopRearrangeDescriptor_t rearrange_desc_q = nullptr;
     size_t q_cont_size = 0;
-    infiniopTensorDescriptor_t rearranged_q_desc;
+    infiniopTensorDescriptor_t rearranged_q_desc = nullptr;
     // Rearrange q into contiguous
     if (!q_desc->isContiguous(0, 1)) {
         CHECK_STATUS(infiniopCreateTensorDescriptor(&rearranged_q_desc, 3, q_desc->shape().data(), nullptr, q_desc->dtype()));
         q_cont_size = utils::align(rearranged_q_desc->numel() * infiniSizeOf(rearranged_q_desc->dtype()), alignment);
-        rearrange_desc_q = new InfiniopDescriptor;
         CHECK_STATUS(infiniopCreateRearrangeDescriptor(handle, &rearrange_desc_q, rearranged_q_desc, q_desc));
     }
 
@@ -213,6 +331,15 @@ __INFINI_C __export infiniStatus_t infiniopCreateAttentionDescriptor(infiniopHan
         k_cache_offset,
         v_cache_offset,
         1.f / std::sqrt(float(head_dim)),
+        false,
+        q_desc->dtype(),
+        n_q_head,
+        n_kv_head,
+        seq_len,
+        head_dim,
+        total_seq_len,
+        k_cache_desc->shape()[1],
+        pos,
     };
 
     return INFINI_STATUS_SUCCESS;
@@ -234,6 +361,30 @@ __INFINI_C __export infiniStatus_t infiniopAttention(infiniopAttentionDescriptor
                                                      void *v_cache,
                                                      void *stream) {
     auto desc = (InfiniopAttentionDescriptor *)desc_;
+
+#ifdef ENABLE_ILUVATAR_API
+    if (desc->use_iluvatar_fused) {
+        CHECK_STATUS(infiniopRearrange(desc->rearrange_desc_k,
+                                       (char *)k_cache + desc->k_cache_offset, k, stream));
+        CHECK_STATUS(infiniopRearrange(desc->rearrange_desc_v,
+                                       (char *)v_cache + desc->v_cache_offset, v, stream));
+        return op::attention::iluvatar::fused_attention(desc->dtype,
+                                                        out,
+                                                        q,
+                                                        k,
+                                                        v,
+                                                        k_cache,
+                                                        v_cache,
+                                                        desc->n_q_head,
+                                                        desc->seq_len,
+                                                        desc->head_dim,
+                                                        desc->total_seq_len,
+                                                        desc->cache_len,
+                                                        desc->pos,
+                                                        stream);
+    }
+#endif
+
     if (workspace_size_ < desc->workspace_size) {
         return INFINI_STATUS_INSUFFICIENT_WORKSPACE; // STATUS_MEMORY_NOT_ALLOCATED
     }
@@ -279,12 +430,24 @@ __INFINI_C __export infiniStatus_t infiniopDestroyAttentionDescriptor(infiniopAt
     if (desc->rearrange_desc_q) {
         CHECK_STATUS(infiniopDestroyRearrangeDescriptor(desc->rearrange_desc_q));
     }
-    CHECK_STATUS(infiniopDestroyRearrangeDescriptor(desc->rearrange_desc_k));
-    CHECK_STATUS(infiniopDestroyRearrangeDescriptor(desc->rearrange_desc_v));
-    CHECK_STATUS(infiniopDestroyRearrangeDescriptor(desc->rearrange_desc_out));
-    CHECK_STATUS(infiniopDestroyGemmDescriptor(desc->matmul_desc1));
-    CHECK_STATUS(infiniopDestroyGemmDescriptor(desc->matmul_desc2));
-    CHECK_STATUS(infiniopDestroyCausalSoftmaxDescriptor(desc->softmax_desc));
+    if (desc->rearrange_desc_k) {
+        CHECK_STATUS(infiniopDestroyRearrangeDescriptor(desc->rearrange_desc_k));
+    }
+    if (desc->rearrange_desc_v) {
+        CHECK_STATUS(infiniopDestroyRearrangeDescriptor(desc->rearrange_desc_v));
+    }
+    if (desc->rearrange_desc_out) {
+        CHECK_STATUS(infiniopDestroyRearrangeDescriptor(desc->rearrange_desc_out));
+    }
+    if (desc->matmul_desc1) {
+        CHECK_STATUS(infiniopDestroyGemmDescriptor(desc->matmul_desc1));
+    }
+    if (desc->matmul_desc2) {
+        CHECK_STATUS(infiniopDestroyGemmDescriptor(desc->matmul_desc2));
+    }
+    if (desc->softmax_desc) {
+        CHECK_STATUS(infiniopDestroyCausalSoftmaxDescriptor(desc->softmax_desc));
+    }
     delete desc;
 
     return INFINI_STATUS_SUCCESS;
