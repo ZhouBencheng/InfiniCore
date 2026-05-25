@@ -21,7 +21,7 @@ struct Relu6Op {
         } else if constexpr (std::is_same_v<T, float>) {
             return fminf(fmaxf(x, 0.0f), 6.0f);
         } else if constexpr (std::is_same_v<T, double>) {
-            return std::min(std::max(x, 0.0), 6.0);
+            return x < 0.0 ? 0.0 : (x > 6.0 ? 6.0 : x);
         } else {
             float xf = static_cast<float>(x);
             float result = fminf(fmaxf(xf, 0.0f), 6.0f);
