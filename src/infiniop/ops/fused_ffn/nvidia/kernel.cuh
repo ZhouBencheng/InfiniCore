@@ -65,6 +65,11 @@ INFINIOP_CUDA_KERNEL rmsnormKernel(
 // Computes: gate_up[i] = silu(gate_up[i]) * gate_up[di+i] for i in [0, di)
 // Writes result to the gate half of gate_up, overwriting gate values.
 // This matches the non-fused path's buffer layout (hidden at stride 2*di).
+//
+// Used by the metax backend's fused_ffn path. The nvidia backend uses the
+// out-of-place variant below (`swigluOutKernel`) to write into a separate
+// hidden_buf with stride di — saves the down-GEMM from having to read a
+// stride-2*di operand.
 template <unsigned int BLOCK_SIZE, typename Tcompute, typename Tdata>
 __device__ void swigluBlock(
     Tdata *__restrict__ gate_up,
@@ -95,6 +100,52 @@ INFINIOP_CUDA_KERNEL swigluKernel(
     if (blockIdx.x < ntok) {
         swigluBlock<BLOCK_SIZE, Tcompute>(
             gate_up, intermediate_dim, stride);
+    }
+}
+
+// SwiGLU transform kernel (out-of-place)
+// Computes: hidden[token, j] = silu(gate_up[token, j]) * gate_up[token, di + j]
+// Reads gate (first half) and up (second half) from a row of gate_up_buf with
+// stride `gate_up_row_stride`; writes silu(gate)*up to hidden_buf with stride
+// `hidden_row_stride`. Caller guarantees the gate_up layout is [gate|up].
+//
+// This is what the nvidia FusedFFN calculate() launches directly to skip the
+// standalone op::swiglu::nvidia::Descriptor's elementwise-framework overhead.
+template <unsigned int BLOCK_SIZE, typename Tcompute, typename Tdata>
+__device__ void swigluOutBlock(
+    Tdata *__restrict__ hidden,
+    const Tdata *__restrict__ gate_up,
+    size_t intermediate_dim,
+    ptrdiff_t hidden_row_stride,
+    ptrdiff_t gate_up_row_stride) {
+
+    size_t token_idx = blockIdx.x;
+    auto h_ptr = hidden + token_idx * hidden_row_stride;
+    auto gu_ptr = gate_up + token_idx * gate_up_row_stride;
+
+    for (size_t i = threadIdx.x; i < intermediate_dim; i += BLOCK_SIZE) {
+        Tcompute gate = Tcompute(gu_ptr[i]);
+        Tcompute up = Tcompute(gu_ptr[intermediate_dim + i]);
+
+        Tcompute sigmoid = Tcompute(1.0f) / (Tcompute(1.0f) + exp_(-gate));
+        Tcompute silu = gate * sigmoid;
+
+        h_ptr[i] = Tdata(silu * up);
+    }
+}
+
+template <unsigned int BLOCK_SIZE, typename Tcompute, typename Tdata>
+INFINIOP_CUDA_KERNEL swigluOutKernel(
+    Tdata *__restrict__ hidden,
+    const Tdata *__restrict__ gate_up,
+    size_t ntok,
+    size_t intermediate_dim,
+    ptrdiff_t hidden_row_stride,
+    ptrdiff_t gate_up_row_stride) {
+    if (blockIdx.x < ntok) {
+        swigluOutBlock<BLOCK_SIZE, Tcompute>(
+            hidden, gate_up, intermediate_dim,
+            hidden_row_stride, gate_up_row_stride);
     }
 }
 

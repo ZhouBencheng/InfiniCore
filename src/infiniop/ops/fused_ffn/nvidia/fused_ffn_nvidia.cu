@@ -1,20 +1,33 @@
+// ────────────────────────────────────────────────────────────────────────────
+// FusedFFN — nvidia / iluvatar BI-V150 implementation
+// ────────────────────────────────────────────────────────────────────────────
+//
+// Five sub-descriptors used to be wired up here: RMSNorm + Gemm +
+// SwiGLU + Gemm + Add. Each elementwise sub-descriptor's calculate()
+// re-queries workspace size, re-walks tensor descriptors, does a dtype
+// switch, and finally launches its kernel. For sub-millisecond ops on
+// BI-V150 that host-side path costs ≈ 5-15 µs per stage, and three of
+// them stacked together turned what should have been a launch-count
+// saving (1 fused call vs 4 unfused calls) into a per-op regression vs
+// the externally-chained unfused path.
+//
+// We now keep only the two cuBLAS GEMM sub-descriptors (cuBLAS is the
+// floor on this hardware's tensor-core path) and launch RMSNorm,
+// SwiGLU and the residual Add directly from calculate() using the
+// templates in kernel.cuh. Launch params (block size, grid, strides)
+// resolve from FusedFFNInfo at create() time; per-call host work is one
+// dtype switch plus the kernel launch. The elementwise kernels are the
+// same templates the standalone ops would have launched, so output is
+// bit-identical to the old path.
+// ────────────────────────────────────────────────────────────────────────────
+
 #include "../../../devices/nvidia/nvidia_common.cuh"
 #include "../../../devices/nvidia/nvidia_kernel_common.cuh"
 #include "fused_ffn_nvidia.cuh"
 #include "kernel.cuh"
 
-// Each op's public header re-defines a DESCRIPTOR(NAMESPACE) macro without
-// guarding it, so including multiple sub-op headers in this TU clashes.
-// We #undef between includes to sidestep the collision; order is arbitrary.
 #undef DESCRIPTOR
 #include "../../gemm/nvidia/gemm_nvidia.cuh"
-#undef DESCRIPTOR
-#include "../../rms_norm/nvidia/rms_norm_nvidia.cuh"
-
-// swiglu / add use a separate ELEMENTWISE_DESCRIPTOR macro so they do not
-// clash with the DESCRIPTOR macro above.
-#include "../../add/nvidia/add_nvidia.cuh"
-#include "../../swiglu/nvidia/swiglu_nvidia.cuh"
 
 #include <algorithm>
 #include <cstdlib>
@@ -92,26 +105,19 @@ struct Descriptor::Opaque {
 
     bool has_residual = false;
 
-    // Deep-fused Gate-Up + SwiGLU (paper-style fusion) config.
-    // Decided at create-time via env var INFINIOP_FUSED_FFN_DEEP and
-    // a profile-driven scheduler that checks ntok against a threshold:
-    //   INFINIOP_FUSED_FFN_DEEP=0 or unset -> always 5-stage (default)
-    //   INFINIOP_FUSED_FFN_DEEP=1          -> scheduler: deep-fused when
-    //       ntok <= threshold, else 5-stage. Threshold defaults to 4 and
-    //       can be overridden with INFINIOP_FUSED_FFN_DEEP_MAX_NTOK.
-    //   INFINIOP_FUSED_FFN_DEEP=2          -> force deep-fused always
-    //       (debug/profiling only; will regress at large ntok)
+    // Deep-fused Gate-Up + SwiGLU config. Resolved from INFINIOP_FUSED_FFN_DEEP
+    // at create() — see the env-var dispatch block in Descriptor::create() for
+    // the full mode/threshold semantics.
     bool use_deep_fused = false;
     ptrdiff_t gate_up_w_k_stride = 0;
     ptrdiff_t gate_up_w_col_stride = 0;
 
-    // Sub-descriptors owned by this fused op; each one is a standard
-    // InfiniopDescriptor for the corresponding standalone operator.
-    std::unique_ptr<op::rms_norm::nvidia::Descriptor> rms_norm;
+    // GEMM sub-descriptors stay (cuBLAS path). RMSNorm / SwiGLU / Add are
+    // launched directly via the kernel.cuh templates in calculate() so they
+    // skip the per-call workspace-size query + virtual-call + dtype-switch
+    // overhead the standalone sub-descriptors would otherwise pay.
     std::unique_ptr<op::gemm::nvidia::Descriptor> gate_up_gemm;
-    std::unique_ptr<op::swiglu::nvidia::Descriptor> swiglu;
     std::unique_ptr<op::gemm::nvidia::Descriptor> down_gemm;
-    std::unique_ptr<op::add::nvidia::Descriptor> residual_add;
 };
 
 Descriptor::~Descriptor() {
@@ -207,24 +213,16 @@ infiniStatus_t Descriptor::create(
 
     DescScope scope;
 
-    // ── RMSNorm sub-descriptor ──
-    // Activation is 2-D [ntok, d]; weight is 1-D [d].
+    // RMSNorm, SwiGLU and the residual Add no longer get their own sub-
+    // descriptors — they are launched directly inside calculate() with
+    // params resolved from FusedFFNInfo. Their workspaces would have been 0
+    // anyway (the standalone implementations are workspace-free for these
+    // contiguous shapes), so dropping them does not change inner_ws_bytes.
+
     auto normalized_desc = scope.adopt(
         make2D(info.dtype, ntok, d, static_cast<ptrdiff_t>(d), 1));
-    auto in_view = scope.adopt(
-        make2D(info.dtype, ntok, d, info.in_stride, 1));
 
-    {
-        op::rms_norm::nvidia::Descriptor *sub = nullptr;
-        CHECK_STATUS(op::rms_norm::nvidia::Descriptor::create(
-            handle_, &sub,
-            normalized_desc, in_view, norm_weight_desc,
-            info.epsilon));
-        opaque->rms_norm.reset(sub);
-        opaque->inner_ws_bytes = std::max(opaque->inner_ws_bytes, sub->workspaceSize());
-    }
-
-    // ── GateUp GEMM sub-descriptor ──
+    // ── GateUp GEMM sub-descriptor (cuBLAS path) ──
     //   [ntok, 2*di] = [ntok, d] @ [d, 2*di]
     auto gate_up_c_desc = scope.adopt(
         make2D(info.dtype, ntok, 2 * di, static_cast<ptrdiff_t>(2 * di), 1));
@@ -239,30 +237,12 @@ infiniStatus_t Descriptor::create(
         opaque->inner_ws_bytes = std::max(opaque->inner_ws_bytes, sub->workspaceSize());
     }
 
-    // ── SwiGLU sub-descriptor ──
-    // Operates on the interleaved [gate | up] buffer:
-    //   logical inputs : up   [ntok, di] row stride 2*di
-    //                    gate [ntok, di] row stride 2*di
-    //   logical output : hidden [ntok, di] contiguous
-    // gate and up share identical shape/strides — only their base pointers
-    // differ at calculate time.
+    // hidden_desc is still needed: it describes the A-matrix of the Down GEMM.
     auto hidden_desc = scope.adopt(
         make2D(info.dtype, ntok, di, static_cast<ptrdiff_t>(di), 1));
-    auto half_desc = scope.adopt(
-        make2D(info.dtype, ntok, di, static_cast<ptrdiff_t>(2 * di), 1));
 
-    {
-        op::swiglu::nvidia::Descriptor *sub = nullptr;
-        CHECK_STATUS(op::swiglu::nvidia::Descriptor::create(
-            handle_, &sub, hidden_desc, {half_desc, half_desc}));
-        opaque->swiglu.reset(sub);
-        opaque->inner_ws_bytes = std::max(opaque->inner_ws_bytes, sub->workspaceSize());
-    }
-
-    // ── Down GEMM sub-descriptor ──
+    // ── Down GEMM sub-descriptor (cuBLAS path) ──
     //   out = [beta * out] + 1.0 * hidden @ down_weight
-    // The output matrix uses the user's out stride so the gemm writes
-    // directly into the caller's tensor.
     auto out_view = scope.adopt(
         make2D(info.dtype, ntok, d, info.out_stride, 1));
     auto down_b_desc = scope.adopt(
@@ -273,24 +253,6 @@ infiniStatus_t Descriptor::create(
         CHECK_STATUS(op::gemm::nvidia::Descriptor::create(
             handle_, &sub, out_view, hidden_desc, down_b_desc));
         opaque->down_gemm.reset(sub);
-        opaque->inner_ws_bytes = std::max(opaque->inner_ws_bytes, sub->workspaceSize());
-    }
-
-    // ── Residual add sub-descriptor (optional) ──
-    // Only used when residual is a distinct tensor from out; the
-    // (out == residual) case is fused into the Down-GEMM via beta=1 at
-    // calculate time.
-    if (info.has_residual) {
-        auto residual_view = scope.adopt(
-            make2D(info.dtype, ntok, d, info.residual_stride, 1));
-        auto out_view_for_add = scope.adopt(
-            make2D(info.dtype, ntok, d, info.out_stride, 1));
-
-        op::add::nvidia::Descriptor *sub = nullptr;
-        CHECK_STATUS(op::add::nvidia::Descriptor::create(
-            handle_, &sub,
-            out_view_for_add, {out_view_for_add, residual_view}));
-        opaque->residual_add.reset(sub);
         opaque->inner_ws_bytes = std::max(opaque->inner_ws_bytes, sub->workspaceSize());
     }
 
@@ -318,11 +280,13 @@ infiniStatus_t Descriptor::calculate(
         return INFINI_STATUS_INSUFFICIENT_WORKSPACE;
     }
 
+    const size_t ntok = _info.ntok();
+    const size_t d = _info.d();
     const size_t di = _info.di();
-    const size_t dtype_sz = infiniSizeOf(_info.dtype);
+    cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
 
     // Partition the workspace into the three persistent slabs plus an
-    // inner scratch buffer shared by all sub-descriptors.
+    // inner scratch buffer shared by the two GEMM sub-descriptors.
     char *ws = static_cast<char *>(workspace);
     void *normalized_buf = ws;
     ws += _opaque->normalized_bytes;
@@ -333,30 +297,46 @@ infiniStatus_t Descriptor::calculate(
     void *inner_ws = ws;
     const size_t inner_ws_size = _opaque->inner_ws_bytes;
 
-    // gate and up are two halves of the interleaved gate_up buffer.
-    // Each token's layout is [gate[0..di) | up[0..di)], so gate starts at
-    // offset 0 and up starts at offset (di * dtype_sz) bytes within the
-    // first row; both use a row stride of 2*di elements (captured in the
-    // shared half_desc at create time).
-    const char *gu_bytes = static_cast<const char *>(gate_up_buf);
-    const void *gate_ptr = gu_bytes;
-    const void *up_ptr = gu_bytes + di * dtype_sz;
+    // ── Stage 1: RMSNorm — direct kernel launch. ──
+    // Block size is hardcoded to 1024. On BI-V150 maxThreadsPerBlock is 8192,
+    // and every other backend that compiles this TU supports 1024; doing this
+    // statically lets calculate() skip the standalone RMSNorm's per-call
+    // maxThreadsPerBlock() lookup + 4-way block-size switch.
+    {
+        constexpr unsigned int kRmsBlock = 1024;
+        const ptrdiff_t in_stride = _info.in_stride;
+        const ptrdiff_t out_stride = static_cast<ptrdiff_t>(d);
 
-    // Stage 1: RMSNorm
-    CHECK_STATUS(_opaque->rms_norm->calculate(
-        inner_ws, inner_ws_size,
-        normalized_buf, in, norm_weight, stream));
+#define LAUNCH_RMSNORM(TD, TW)                                       \
+    rmsnormKernel<kRmsBlock, float, TD, TW>                          \
+        <<<static_cast<unsigned>(ntok), kRmsBlock, 0, cuda_stream>>>(\
+            reinterpret_cast<TD *>(normalized_buf),                  \
+            reinterpret_cast<const TD *>(in),                        \
+            reinterpret_cast<const TW *>(norm_weight),               \
+            ntok, d, _info.epsilon,                                  \
+            in_stride, out_stride)
+
+        if (_info.dtype == INFINI_DTYPE_F16 && _info.wtype == INFINI_DTYPE_F16) {
+            LAUNCH_RMSNORM(half, half);
+        } else if (_info.dtype == INFINI_DTYPE_F16 && _info.wtype == INFINI_DTYPE_F32) {
+            LAUNCH_RMSNORM(half, float);
+        } else if (_info.dtype == INFINI_DTYPE_BF16 && _info.wtype == INFINI_DTYPE_BF16) {
+            LAUNCH_RMSNORM(__nv_bfloat16, __nv_bfloat16);
+        } else if (_info.dtype == INFINI_DTYPE_BF16 && _info.wtype == INFINI_DTYPE_F32) {
+            LAUNCH_RMSNORM(__nv_bfloat16, float);
+        } else if (_info.dtype == INFINI_DTYPE_F32 && _info.wtype == INFINI_DTYPE_F32) {
+            LAUNCH_RMSNORM(float, float);
+        } else {
+            return INFINI_STATUS_BAD_TENSOR_DTYPE;
+        }
+#undef LAUNCH_RMSNORM
+    }
 
     if (_opaque->use_deep_fused) {
         // Stage 2+3 fused: one kernel produces hidden = SiLU(norm@Wg) * (norm@Wu)
         // directly, eliminating the gate_up_buf HBM round-trip. Row strides
         // for X and hidden are d and di respectively (contiguous buffers
         // allocated at create time).
-        cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
-        const size_t ntok = _info.ntok();
-        const size_t d = _info.d();
-        const size_t di = _info.di();
-
         constexpr unsigned int kBlock = 256;
         dim3 grid(static_cast<unsigned>(ntok), static_cast<unsigned>(di));
         dim3 block(kBlock);
@@ -388,11 +368,6 @@ infiniStatus_t Descriptor::calculate(
             return INFINI_STATUS_BAD_TENSOR_DTYPE;
         }
 #undef DEEP_FUSED_LAUNCH
-        // Avoid unused-variable warnings for the baseline-only pointers when
-        // the deep-fused branch takes over stage 2/3.
-        (void)gate_up_buf;
-        (void)gate_ptr;
-        (void)up_ptr;
     } else {
         // Stage 2: GateUp GEMM  -->  gate_up_buf = normalized_buf @ gate_up_weight
         CHECK_STATUS(_opaque->gate_up_gemm->calculate(
@@ -401,12 +376,38 @@ infiniStatus_t Descriptor::calculate(
             normalized_buf, gate_up_weight,
             /*alpha=*/1.f, stream));
 
-        // Stage 3: SwiGLU  -->  hidden_buf = silu(gate) * up
-        // swiglu::nvidia expects inputs ordered {up, gate}; see
-        // swiglu_nvidia.cu input_desc_vec[0]=up, [1]=gate.
-        CHECK_STATUS(_opaque->swiglu->calculate(
-            inner_ws, inner_ws_size,
-            hidden_buf, {up_ptr, gate_ptr}, stream));
+        // ── Stage 3: SwiGLU — direct kernel launch. ──
+        // Reads two halves of the interleaved gate_up_buf row (stride 2*di)
+        // and writes hidden_buf (stride di). Skips the standalone SwiGLU's
+        // elementwise framework metadata setup per call.
+        {
+            constexpr unsigned int kSwigluBlock = 256;
+            const ptrdiff_t hidden_row_stride = static_cast<ptrdiff_t>(di);
+            const ptrdiff_t gate_up_row_stride = static_cast<ptrdiff_t>(2 * di);
+
+#define LAUNCH_SWIGLU(TD)                                            \
+    swigluOutKernel<kSwigluBlock, float, TD>                         \
+        <<<static_cast<unsigned>(ntok), kSwigluBlock, 0, cuda_stream>>>( \
+            reinterpret_cast<TD *>(hidden_buf),                      \
+            reinterpret_cast<const TD *>(gate_up_buf),               \
+            ntok, di,                                                \
+            hidden_row_stride, gate_up_row_stride)
+
+            switch (_info.dtype) {
+            case INFINI_DTYPE_F16:
+                LAUNCH_SWIGLU(half);
+                break;
+            case INFINI_DTYPE_BF16:
+                LAUNCH_SWIGLU(__nv_bfloat16);
+                break;
+            case INFINI_DTYPE_F32:
+                LAUNCH_SWIGLU(float);
+                break;
+            default:
+                return INFINI_STATUS_BAD_TENSOR_DTYPE;
+            }
+#undef LAUNCH_SWIGLU
+        }
     }
 
     // Stage 4: Down GEMM, with optional in-place residual fuse via beta=1.
@@ -419,11 +420,36 @@ infiniStatus_t Descriptor::calculate(
         hidden_buf, down_weight,
         /*alpha=*/1.f, stream));
 
-    // Stage 5: Residual add (only when the in-place fuse did not apply).
+    // ── Stage 5: Residual Add — direct kernel launch. ──
+    // Only fires when out != residual (the (out == residual) case is already
+    // absorbed by the Down GEMM's beta=1 epilogue above).
     if (_opaque->has_residual && !fuse_residual) {
-        CHECK_STATUS(_opaque->residual_add->calculate(
-            inner_ws, inner_ws_size,
-            out, {out, residual}, stream));
+        constexpr unsigned int kAddBlock = 256;
+
+#define LAUNCH_ADD(TD)                                               \
+    residualAddKernel<kAddBlock, float, TD>                          \
+        <<<static_cast<unsigned>(ntok), kAddBlock, 0, cuda_stream>>>(\
+            reinterpret_cast<TD *>(out),                             \
+            reinterpret_cast<const TD *>(out),                       \
+            reinterpret_cast<const TD *>(residual),                  \
+            ntok, d,                                                 \
+            _info.out_stride,                                        \
+            _info.residual_stride)
+
+        switch (_info.dtype) {
+        case INFINI_DTYPE_F16:
+            LAUNCH_ADD(half);
+            break;
+        case INFINI_DTYPE_BF16:
+            LAUNCH_ADD(__nv_bfloat16);
+            break;
+        case INFINI_DTYPE_F32:
+            LAUNCH_ADD(float);
+            break;
+        default:
+            return INFINI_STATUS_BAD_TENSOR_DTYPE;
+        }
+#undef LAUNCH_ADD
     }
 
     return INFINI_STATUS_SUCCESS;
