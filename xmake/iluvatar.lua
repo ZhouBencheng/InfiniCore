@@ -1,4 +1,4 @@
-local iluvatar_arch = get_config("iluvatar_arch") or "ivcore20"
+local iluvatar_arch = get_config("iluvatar_arch") or "ivcore11"
 
 toolchain("iluvatar.toolchain")
     set_toolset("cc"  , "clang"  )
