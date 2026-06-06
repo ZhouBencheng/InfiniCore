@@ -26,6 +26,7 @@
 #include "ops/flash_attention.hpp"
 #include "ops/fmin.hpp"
 #include "ops/fmod.hpp"
+#include "ops/fused_ffn.hpp"
 #include "ops/gelu.hpp"
 #include "ops/gelutanh.hpp"
 #include "ops/hardswish.hpp"
