@@ -27,7 +27,7 @@ __global__ void sumAllKernel(
     }
 
     if (tid == 0) {
-        atomicAdd(output, s_data[0]);
+        atomicAddSafe(output, s_data[0]);
     }
 }
 

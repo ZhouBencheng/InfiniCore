@@ -62,7 +62,7 @@ __device__ __forceinline__ void atomic_add_custom(int64_t *address, int64_t val)
 // --- 通用模板 (float, double, int32 等) ---
 template <typename T>
 __device__ __forceinline__ void atomic_add_custom(T *address, T val) {
-    atomicAdd(address, val);
+    atomicAddSafe(address, val);
 }
 
 // ==================================================================

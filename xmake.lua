@@ -106,10 +106,10 @@ option("iluvatar-gpu")
 option_end()
 
 option("iluvatar_arch")
-    set_default("ivcore11")
+    set_default("native")
     set_showmenu(true)
-    set_description("Set Iluvatar GPU architecture (e.g. ivcore11)")
-    set_values("ivcore11", "ivcore20")
+    set_description("Set Iluvatar GPU architecture (e.g. native)")
+    set_values("native")
     set_category("option")
 option_end()
 

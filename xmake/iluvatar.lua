@@ -1,4 +1,4 @@
-local iluvatar_arch = get_config("iluvatar_arch") or "ivcore11"
+local iluvatar_arch = get_config("iluvatar_arch") or "native"
 
 toolchain("iluvatar.toolchain")
     set_toolset("cc"  , "clang"  )
@@ -46,18 +46,20 @@ target("infiniop-iluvatar")
     set_warnings("all", "error")
     add_cuflags("-Wno-error=unused-private-field", "-Wno-error=unused-variable", "-Wno-unused-variable")
     add_cuflags("-fPIC", "-x", "ivcore", "-std=c++17", {force = true})
-    add_cuflags("--cuda-gpu-arch=" .. iluvatar_arch, {force = true})
+    add_cuflags("--offload-arch=" .. iluvatar_arch, {force = true})
     add_culdflags("-fPIC")
     add_cxflags("-fPIC", "-Wno-error=unused-variable", "-Wno-unused-variable")
     add_cxxflags("-fPIC", "-Wno-error=unused-variable", "-Wno-unused-variable")
 
     -- set_languages("cxx17") 天数似乎不能用这个配置
     add_files("../src/infiniop/devices/nvidia/*.cu", "../src/infiniop/ops/*/nvidia/*.cu")
-    -- skip gaussian_nll_loss and hinge_embedding_loss and adapt them later
-    remove_files("../src/infiniop/ops/gaussian_nll_loss/nvidia/*.cu")
-    remove_files("../src/infiniop/ops/hinge_embedding_loss/nvidia/*.cu")
+    -- skip scaled_mm, adapt it later
+    -- remove_files("../src/infiniop/ops/scaled_mm/nvidia/*.cu")
 
     add_files("../src/infiniop/ops/*/iluvatar/*.cu")
+    -- 天数平台不支持部分 NVIDIA PTX 指令，AWQ 反量化改用 CUDA C++ 实现
+    add_files("../src/infiniop/ops/dequantize_awq/iluvatar/*.cu")
+    add_files("../src/infiniop/ops/dequantize_gptq/iluvatar/*.cu")
 
     if has_config("ninetoothed") then
         add_files("../build/ninetoothed/*.c", "../build/ninetoothed/*.cpp", {cxxflags = {"-Wno-return-type"}})
@@ -77,7 +79,7 @@ target("infinirt-iluvatar")
 
     set_warnings("all", "error")
     add_cuflags("-fPIC", "-x", "ivcore", "-std=c++17", {force = true})
-    add_cuflags("--cuda-gpu-arch=" .. iluvatar_arch, {force = true})
+    add_cuflags("--offload-arch=" .. iluvatar_arch, {force = true})
     add_culdflags("-fPIC")
     add_cxflags("-fPIC")
     add_cxxflags("-fPIC")
@@ -100,7 +102,7 @@ target("infiniccl-iluvatar")
 
         set_warnings("all", "error")
         add_cuflags("-fPIC", "-x", "ivcore", "-std=c++17", {force = true})
-        add_cuflags("--cuda-gpu-arch=" .. iluvatar_arch, {force = true})
+        add_cuflags("--offload-arch=" .. iluvatar_arch, {force = true})
         add_culdflags("-fPIC")
         add_cxflags("-fPIC")
         add_cxxflags("-fPIC")

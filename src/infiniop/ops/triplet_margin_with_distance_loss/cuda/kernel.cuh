@@ -121,7 +121,7 @@ __global__ void triplet_margin_loss_kernel(
         if (reduction == 0) { // None
             output[batch_idx] = static_cast<T>(loss);
         } else { // Sum or Mean
-            atomicAdd(reduction_buffer, loss);
+            atomicAddSafe(reduction_buffer, loss);
         }
     }
 }

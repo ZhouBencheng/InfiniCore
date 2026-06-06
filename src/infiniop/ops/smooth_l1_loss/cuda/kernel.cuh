@@ -129,7 +129,7 @@ __global__ void smooth_l1_loss_reduce_kernel(
 
     // Global Atomic Add
     if (threadIdx.x == 0) {
-        atomicAdd(output, block_sum * scale);
+        atomicAddSafe(output, block_sum * scale);
     }
 }
 

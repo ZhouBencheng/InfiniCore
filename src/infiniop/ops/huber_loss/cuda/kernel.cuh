@@ -93,7 +93,7 @@ __global__ void huber_loss_reduce_kernel(
     float block_sum = blockReduceSum(local_sum);
 
     if (threadIdx.x == 0) {
-        atomicAdd(output, block_sum * scale);
+        atomicAddSafe(output, block_sum * scale);
     }
 }
 

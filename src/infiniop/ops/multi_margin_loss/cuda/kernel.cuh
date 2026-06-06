@@ -158,7 +158,7 @@ __global__ void multi_margin_loss_reduce_kernel(
 
     // Global Atomic Add (Reduce to scalar)
     if (threadIdx.x == 0) {
-        atomicAdd(output, block_sum * scale);
+        atomicAddSafe(output, block_sum * scale);
     }
 }
 template <typename T>

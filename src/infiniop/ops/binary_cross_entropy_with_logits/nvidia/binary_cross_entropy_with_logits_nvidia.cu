@@ -157,7 +157,7 @@ __global__ void bce_logits_kernel(
     } else {
         // 对于 mean 或 sum，使用 float 累加到标量位置
         auto *out_accum = static_cast<Taccum *>(out_raw);
-        atomicAdd(out_accum, static_cast<Taccum>(loss));
+        atomicAddSafe(out_accum, static_cast<Taccum>(loss));
     }
 }
 

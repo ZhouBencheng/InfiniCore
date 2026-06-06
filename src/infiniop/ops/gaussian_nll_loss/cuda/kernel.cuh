@@ -126,7 +126,7 @@ __global__ void gaussian_nll_loss_reduce_kernel(
     Tcompute block_sum = BlockReduce(temp_storage).Sum(sum);
 
     if (threadIdx.x == 0) {
-        atomicAdd(output, block_sum);
+        atomicAddSafe(output, block_sum);
     }
 }
 
@@ -204,7 +204,7 @@ __global__ void gaussian_nll_loss_reduce_kernel(
     const Tcompute block_sum = BlockReduce(temp_storage).Sum(sum);
 
     if (threadIdx.x == 0) {
-        atomicAdd(reinterpret_cast<Tcompute *>(output), block_sum);
+        atomicAddSafe(reinterpret_cast<Tcompute *>(output), block_sum);
     }
 }
 

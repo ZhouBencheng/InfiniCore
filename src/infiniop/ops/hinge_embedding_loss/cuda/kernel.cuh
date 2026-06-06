@@ -121,7 +121,7 @@ __global__ void hinge_embedding_loss_reduce_kernel(
     const Tcompute block_sum = BlockReduce(temp_storage).Sum(sum);
 
     if (threadIdx.x == 0) {
-        atomicAdd(accum, block_sum);
+        atomicAddSafe(accum, block_sum);
     }
 }
 

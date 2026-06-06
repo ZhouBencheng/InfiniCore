@@ -52,6 +52,32 @@ indexToOffset(
 
 using device::nvidia::indexToOffset;
 
+// Fallback atomic add.
+//
+// Some backends (notably Iluvatar ivcore11) do not provide a native
+// double-precision atomicAdd builtin and fail to compile `__nvvm_atom_add_gen_d`.
+// For those, emulate double atomicAdd with an integer compare-and-swap loop
+// (the standard CUDA fallback). Every other type / backend keeps using the
+// native hardware atomicAdd unchanged.
+template <typename T>
+__forceinline__ __device__ T atomicAddSafe(T *address, T val) {
+    return atomicAdd(address, val);
+}
+
+#if defined(ENABLE_ILUVATAR_API)
+template <>
+__forceinline__ __device__ double atomicAddSafe<double>(double *address, double val) {
+    unsigned long long int *addr_as_ull = reinterpret_cast<unsigned long long int *>(address);
+    unsigned long long int old = *addr_as_ull, assumed;
+    do {
+        assumed = old;
+        old = atomicCAS(addr_as_ull, assumed,
+                        __double_as_longlong(val + __longlong_as_double(assumed)));
+    } while (assumed != old);
+    return __longlong_as_double(old);
+}
+#endif
+
 __forceinline__ __device__ float
 exp_(const float val) {
     return expf(val);
