@@ -79,7 +79,7 @@ infiniStatus_t Descriptor::calculate(
         return _device_info->calculate<256, cuda::ZerosOp, uint32_t>(_info, workspace, output, inputs, stream);
     case INFINI_DTYPE_U64: // 10
         return _device_info->calculate<256, cuda::ZerosOp, uint64_t>(_info, workspace, output, inputs, stream);
-#ifndef ENABLE_HYGON_API
+#if !defined(ENABLE_HYGON_API) && !defined(ENABLE_ILUVATAR_API)
     case INFINI_DTYPE_F8: // 11
         return _device_info->calculate<256, cuda::ZerosOp, cuda_fp8_e4m3>(_info, workspace, output, inputs, stream);
 #endif
