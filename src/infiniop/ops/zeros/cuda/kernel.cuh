@@ -27,7 +27,7 @@ public:
             return 0;
         } else if constexpr (std::is_same_v<T, uint64_t>) { // 10
             return 0;
-#ifndef ENABLE_HYGON_API
+#if !defined(ENABLE_HYGON_API) && !defined(ENABLE_ILUVATAR_API)
         } else if constexpr (std::is_same_v<T, cuda_fp8_e4m3>) { // 11
             return cuda_fp8_e4m3(0.0f);
 #endif
